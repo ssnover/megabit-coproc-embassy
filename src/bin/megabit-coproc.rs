@@ -8,6 +8,10 @@ use embassy_nrf::{
     peripherals, spim,
     usb::{self, vbus_detect::HardwareVbusDetect},
 };
+use embassy_sync::{
+    blocking_mutex::raw::NoopRawMutex,
+    channel::{Channel, Sender},
+};
 use embassy_time::Timer;
 use embassy_usb::{
     class::cdc_acm::{self, CdcAcmClass},
@@ -25,6 +29,8 @@ bind_interrupts!(struct Irqs {
 
 type UsbDriver = usb::Driver<'static, peripherals::USBD, HardwareVbusDetect>;
 
+static SET_LED_CHANNEL: StaticCell<Channel<NoopRawMutex, (u8, u8, bool), 1>> = StaticCell::new();
+
 #[embassy_executor::task]
 async fn usb_driver_task(mut device: embassy_usb::UsbDevice<'static, UsbDriver>) {
     device.run().await;
@@ -35,10 +41,17 @@ async fn ping_response_task(
     mut class: CdcAcmClass<'static, UsbDriver>,
     mut cobs_decoder: CobsBuffer<'static, 1024>,
     encode_buffer: &'static mut [u8; 256],
+    mut led_sender: Sender<'static, NoopRawMutex, (u8, u8, bool), 1>,
 ) {
     loop {
         class.wait_connection().await;
-        let _ = handle_ping(&mut class, &mut cobs_decoder, encode_buffer).await;
+        let _ = handle_ping(
+            &mut class,
+            &mut cobs_decoder,
+            encode_buffer,
+            &mut led_sender,
+        )
+        .await;
     }
 }
 
@@ -83,12 +96,15 @@ async fn main(spawner: embassy_executor::Spawner) {
     let class = CdcAcmClass::new(&mut builder, state, 64);
     let usb = builder.build();
 
+    let channel = SET_LED_CHANNEL.init(Channel::new());
+
     spawner.spawn(usb_driver_task(usb)).unwrap();
     spawner
         .spawn(ping_response_task(
             class,
             cobs_decoder,
             COBS_ENCODE_BUFFER.init([0; 256]),
+            channel.sender(),
         ))
         .unwrap();
 
@@ -108,21 +124,21 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     let mut dot_matrix = DotMatrix::new(spim, ncs_0, ncs_1).await.unwrap();
 
-    for row in 0..16 {
-        for col in 0..32 {
-            dot_matrix.set_pixel(row, col, true).await.unwrap();
-            Timer::after_millis(100).await;
-            dot_matrix.set_pixel(row, col, false).await.unwrap();
-            Timer::after_millis(100).await;
-        }
+    let rx = channel.receiver();
+    loop {
+        let (row, col, state) = rx.receive().await;
+        dot_matrix
+            .set_pixel(row as usize, col as usize, state)
+            .await
+            .unwrap();
     }
 
-    loop {
-        led.set_high();
-        Timer::after_millis(300).await;
-        led.set_low();
-        Timer::after_millis(300).await;
-    }
+    // loop {
+    //     led.set_high();
+    //     Timer::after_millis(300).await;
+    //     led.set_low();
+    //     Timer::after_millis(300).await;
+    // }
 }
 
 struct Disconnected {}
@@ -140,6 +156,7 @@ async fn handle_ping(
     class: &mut CdcAcmClass<'static, UsbDriver>,
     decode_buffer: &mut CobsBuffer<'static, 1024>,
     encode_buffer: &mut [u8; 256],
+    led_sender: &mut Sender<'static, NoopRawMutex, (u8, u8, bool), 1>,
 ) -> Result<(), Disconnected> {
     let mut incoming_buf = [0; 64];
     let mut encoded_buf = [0; 64];
@@ -152,6 +169,14 @@ async fn handle_ping(
                 if incoming_buf[0] == 0xde && incoming_buf[1] == 0x00 {
                     encode_buffer[0] = 0xde;
                     encode_buffer[1] = 0x01;
+                    let encoded_bytes = cobs::encode(&encode_buffer[..2], &mut encoded_buf[..]);
+                    Some(encoded_bytes)
+                } else if incoming_buf[0] == 0xa0 && incoming_buf[1] == 0x50 {
+                    led_sender
+                        .send((incoming_buf[2], incoming_buf[3], incoming_buf[4] != 0x00))
+                        .await;
+                    encode_buffer[0] = 0xa0;
+                    encode_buffer[1] = 0x51;
                     let encoded_bytes = cobs::encode(&encode_buffer[..2], &mut encoded_buf[..]);
                     Some(encoded_bytes)
                 } else {
