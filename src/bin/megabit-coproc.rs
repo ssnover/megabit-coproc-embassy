@@ -13,7 +13,7 @@ use embassy_usb::{
     class::cdc_acm::{self, CdcAcmClass},
     driver::EndpointError,
 };
-use megabit_coproc_embassy::DotMatrix;
+use megabit_coproc_embassy::{cobs_buffer::CobsBuffer, dot_matrix::DotMatrix};
 use panic_probe as _;
 use static_cell::StaticCell;
 
@@ -31,10 +31,14 @@ async fn usb_driver_task(mut device: embassy_usb::UsbDevice<'static, UsbDriver>)
 }
 
 #[embassy_executor::task]
-async fn ping_response_task(mut class: CdcAcmClass<'static, UsbDriver>) {
+async fn ping_response_task(
+    mut class: CdcAcmClass<'static, UsbDriver>,
+    mut cobs_decoder: CobsBuffer<'static, 1024>,
+    encode_buffer: &'static mut [u8; 256],
+) {
     loop {
         class.wait_connection().await;
-        let _ = handle_ping(&mut class).await;
+        let _ = handle_ping(&mut class, &mut cobs_decoder, encode_buffer).await;
     }
 }
 
@@ -54,6 +58,10 @@ async fn main(spawner: embassy_executor::Spawner) {
     config.device_sub_class = 0x02;
     config.device_protocol = 0x01;
     config.composite_with_iads = true;
+
+    static COBS_DECODE_BUFFER: StaticCell<[u8; 1024]> = StaticCell::new();
+    static COBS_ENCODE_BUFFER: StaticCell<[u8; 256]> = StaticCell::new();
+    let cobs_decoder = CobsBuffer::new(COBS_DECODE_BUFFER.init([0; 1024]));
 
     static STATE: StaticCell<cdc_acm::State> = StaticCell::new();
     let state = STATE.init(cdc_acm::State::new());
@@ -76,7 +84,13 @@ async fn main(spawner: embassy_executor::Spawner) {
     let usb = builder.build();
 
     spawner.spawn(usb_driver_task(usb)).unwrap();
-    spawner.spawn(ping_response_task(class)).unwrap();
+    spawner
+        .spawn(ping_response_task(
+            class,
+            cobs_decoder,
+            COBS_ENCODE_BUFFER.init([0; 256]),
+        ))
+        .unwrap();
 
     let mut config = spim::Config::default();
     config.frequency = spim::Frequency::M4;
@@ -122,10 +136,39 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-async fn handle_ping(class: &mut CdcAcmClass<'static, UsbDriver>) -> Result<(), Disconnected> {
-    let mut buf = [0; 64];
+async fn handle_ping(
+    class: &mut CdcAcmClass<'static, UsbDriver>,
+    decode_buffer: &mut CobsBuffer<'static, 1024>,
+    encode_buffer: &mut [u8; 256],
+) -> Result<(), Disconnected> {
+    let mut incoming_buf = [0; 64];
+    let mut encoded_buf = [0; 64];
     loop {
-        let bytes_read = class.read_packet(&mut buf).await?;
-        class.write_packet(&buf[..bytes_read]).await?;
+        let bytes_read = class.read_packet(&mut incoming_buf).await?;
+        decode_buffer.write_bytes(&incoming_buf[..bytes_read]);
+        let encoded_bytes = if let Ok(decoded_bytes) = decode_buffer.read_packet(&mut incoming_buf)
+        {
+            if decoded_bytes >= 2 {
+                if incoming_buf[0] == 0xde && incoming_buf[1] == 0x00 {
+                    encode_buffer[0] = 0xde;
+                    encode_buffer[1] = 0x01;
+                    let encoded_bytes = cobs::encode(&encode_buffer[..2], &mut encoded_buf[..]);
+                    Some(encoded_bytes)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(encoded_bytes) = encoded_bytes {
+            encoded_buf[encoded_bytes] = 0x00;
+            class
+                .write_packet(&encoded_buf[..encoded_bytes + 1])
+                .await?;
+        }
     }
 }
