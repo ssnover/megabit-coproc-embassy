@@ -71,6 +71,22 @@ impl<
         Self::update_display_row(ncs, &mut self.spi_driver, subrow, &self.state_buffer[row]).await
     }
 
+    pub async fn update_row(&mut self, row: usize, row_data: [u8; 4]) -> Result<(), SPIERR> {
+        self.state_buffer[row] = row_data;
+        let (ncs, subrow) = if (0..8).contains(&row) {
+            (
+                &mut self.ncs_0 as &mut dyn OutputPin<Error = Infallible>,
+                row,
+            )
+        } else {
+            (
+                &mut self.ncs_1 as &mut dyn OutputPin<Error = Infallible>,
+                row - 8,
+            )
+        };
+        Self::update_display_row(ncs, &mut self.spi_driver, subrow, &self.state_buffer[row]).await
+    }
+
     async fn init_display(
         ncs: &mut dyn OutputPin<Error = Infallible>,
         spi: &mut SPIBUS,

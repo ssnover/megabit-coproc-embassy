@@ -30,6 +30,7 @@ bind_interrupts!(struct Irqs {
 type UsbDriver = usb::Driver<'static, peripherals::USBD, HardwareVbusDetect>;
 
 static SET_LED_CHANNEL: StaticCell<Channel<NoopRawMutex, (u8, u8, bool), 1>> = StaticCell::new();
+static ROW_UPDATE_CHANNEL: StaticCell<Channel<NoopRawMutex, (u8, [u8; 4]), 4>> = StaticCell::new();
 
 #[embassy_executor::task]
 async fn usb_driver_task(mut device: embassy_usb::UsbDevice<'static, UsbDriver>) {
@@ -42,6 +43,7 @@ async fn ping_response_task(
     mut cobs_decoder: CobsBuffer<'static, 1024>,
     encode_buffer: &'static mut [u8; 256],
     mut led_sender: Sender<'static, NoopRawMutex, (u8, u8, bool), 1>,
+    mut row_update_sender: Sender<'static, NoopRawMutex, (u8, [u8; 4]), 4>,
 ) {
     loop {
         class.wait_connection().await;
@@ -50,6 +52,7 @@ async fn ping_response_task(
             &mut cobs_decoder,
             encode_buffer,
             &mut led_sender,
+            &mut row_update_sender,
         )
         .await;
     }
@@ -97,6 +100,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     let usb = builder.build();
 
     let channel = SET_LED_CHANNEL.init(Channel::new());
+    let row_update_channel = ROW_UPDATE_CHANNEL.init(Channel::new());
 
     spawner.spawn(usb_driver_task(usb)).unwrap();
     spawner
@@ -105,6 +109,7 @@ async fn main(spawner: embassy_executor::Spawner) {
             cobs_decoder,
             COBS_ENCODE_BUFFER.init([0; 256]),
             channel.sender(),
+            row_update_channel.sender(),
         ))
         .unwrap();
 
@@ -124,13 +129,15 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     let mut dot_matrix = DotMatrix::new(spim, ncs_0, ncs_1).await.unwrap();
 
-    let rx = channel.receiver();
+    let rx = row_update_channel.receiver();
     loop {
-        let (row, col, state) = rx.receive().await;
-        dot_matrix
-            .set_pixel(row as usize, col as usize, state)
-            .await
-            .unwrap();
+        let (row, row_data) = rx.receive().await;
+        dot_matrix.update_row(row as usize, row_data).await.unwrap();
+        if led.is_set_high() {
+            led.set_low();
+        } else {
+            led.set_high();
+        }
     }
 
     // loop {
@@ -157,6 +164,7 @@ async fn handle_ping(
     decode_buffer: &mut CobsBuffer<'static, 1024>,
     encode_buffer: &mut [u8; 256],
     led_sender: &mut Sender<'static, NoopRawMutex, (u8, u8, bool), 1>,
+    row_update_sender: &mut Sender<'static, NoopRawMutex, (u8, [u8; 4]), 4>,
 ) -> Result<(), Disconnected> {
     let mut incoming_buf = [0; 64];
     let mut encoded_buf = [0; 64];
@@ -178,6 +186,19 @@ async fn handle_ping(
                     encode_buffer[0] = 0xa0;
                     encode_buffer[1] = 0x51;
                     let encoded_bytes = cobs::encode(&encode_buffer[..2], &mut encoded_buf[..]);
+                    Some(encoded_bytes)
+                } else if incoming_buf[0] == 0xa0 && incoming_buf[1] == 0x00 {
+                    let row_number = incoming_buf[2];
+                    let row_data_len = incoming_buf[3];
+                    let mut row_data = [0u8; 4];
+                    row_data.clone_from_slice(&incoming_buf[4..8]);
+
+                    row_update_sender.send((row_number, row_data)).await;
+
+                    encode_buffer[0] = 0xa0;
+                    encode_buffer[1] = 0x01;
+                    encode_buffer[2] = 0x00;
+                    let encoded_bytes = cobs::encode(&encode_buffer[..3], &mut encoded_buf);
                     Some(encoded_bytes)
                 } else {
                     None
